@@ -1,251 +1,582 @@
-﻿#include "cuda_runtime.h"
+﻿// ============================================================
+// GPT-2 推論エンジン（CUDA + Tensor Core + cuBLAS）
+//
+// GPT-2 small アーキテクチャ:
+//   vocab=50257  ctx=1024  embd=768  heads=12  layers=12
+//
+// Tensor Core使用箇所:
+//   cublasGemmEx / cublasGemmStridedBatchedEx
+//   with CUBLAS_COMPUTE_32F_FAST_16F
+//   → 全GEMM（QKV投影/Attention/FFN/LMHead）でTensor Core起動
+//
+// 実行: Cuda-Chan.exe gpt2_weights.bin gpt2_tokenizer.bin
+// ============================================================
+
+#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include <stdio.h>
-#include <cuda_fp16.h>       // FP16型 (__half)
-#include <mma.h>             // Tensor Core (wmma API)
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <cfloat>
+#include <ctime>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
+#include <iostream>
 
-using namespace nvcuda;      // wmma:: を使うため
-
-// ============================================================
-// Step5: FP16 + Tensor Core
-//
-// LLMで何に使うか:
-//   実際のLLM推論は全部FP16（またはBF16）で動いている
-//   GPT/Llama等のモデルファイルもFP16で保存されている
-//   Tensor Coreを使うとFP32より4〜8倍速い
-//
-// FP32 vs FP16:
-//   FP32: 符号1bit + 指数8bit + 仮数23bit = 32bit
-//   FP16: 符号1bit + 指数5bit + 仮数10bit = 16bit
-//   → メモリ使用量が半分、計算が速い、少し精度が落ちる
-//
-// Tensor Coreとは:
-//   行列積専用のハードウェアユニット
-//   RTX 4060は4th Gen Tensor Coreを搭載
-//   16×16×16の行列積を1命令で実行できる
-//
-// wmma (Warp Matrix Multiply Accumulate) API:
-//   Tensor Coreをプログラマが直接叩けるAPI
-//   1ワープ(32スレッド)が協調して16×16行列を処理する
-// ============================================================
-
-#define TILE_SIZE 16  // Tensor Coreの基本サイズ（16×16）
+#pragma comment(lib, "cublas.lib")
 
 // ============================================================
-// ① FP32版 行列積（比較用・Step3と同じ原理）
+// GPT-2 small 定数
 // ============================================================
-__global__ void matmul_fp32(
-    const float* A, const float* B, float* C,
-    int M, int N, int K)
-{
-    __shared__ float s_A[TILE_SIZE][TILE_SIZE];
-    __shared__ float s_B[TILE_SIZE][TILE_SIZE];
+#define N_VOCAB  50257
+#define N_CTX    1024
+#define N_EMBD   768
+#define N_HEAD   12
+#define N_LAYER  12
+#define D_HEAD   64      // N_EMBD / N_HEAD
+#define D_FF     3072    // N_EMBD * 4
+#define MAX_GEN  256
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    int tx = threadIdx.x, ty = threadIdx.y;
-
-    float sum = 0.0f;
-    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++)
-    {
-        s_A[ty][tx] = (row < M && t * TILE_SIZE + tx < K)
-            ? A[row * K + t * TILE_SIZE + tx] : 0.0f;
-        s_B[ty][tx] = (col < N && t * TILE_SIZE + ty < K)
-            ? B[(t * TILE_SIZE + ty) * N + col] : 0.0f;
-        __syncthreads();
-
-        for (int k = 0; k < TILE_SIZE; k++)
-            sum += s_A[ty][k] * s_B[k][tx];
-        __syncthreads();
-    }
-    if (row < M && col < N) C[row * N + col] = sum;
-}
+#define CUDA_CHECK(x) do { \
+    cudaError_t e=(x); \
+    if(e!=cudaSuccess){fprintf(stderr,"CUDA: %s (%s:%d)\n",cudaGetErrorString(e),__FILE__,__LINE__);exit(1);} \
+} while(0)
+#define CUBLAS_CHECK(x) do { \
+    cublasStatus_t s=(x); \
+    if(s!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"cuBLAS error %d (%s:%d)\n",s,__FILE__,__LINE__);exit(1);} \
+} while(0)
 
 // ============================================================
-// ② Tensor Core版 行列積（wmma API使用）
-//
-// ポイント:
-//   1ワープ(32スレッド)で16×16×16の行列積を処理
-//   入力: FP16、出力: FP32（精度を保つため）
-//   これがLLMの実際の計算に一番近い形
+// CUDA カーネル群
 // ============================================================
-__global__ void matmul_tensor_core(
-    const __half* A,   // FP16入力
-    const __half* B,   // FP16入力
-    float* C,          // FP32出力（accumulator）
-    int M, int N, int K)
-{
-    // wmmaのフラグメント（Tensor Coreが扱う行列の断片）
-    // fragment = 1ワープが協調して持つ行列データ
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>    frag_A;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major>    frag_B;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float>                   frag_C;
 
-    // このワープが担当するCのタイル位置
-    int warp_row = (blockIdx.y * blockDim.y + threadIdx.y) / 32 * 16;
-    int warp_col = blockIdx.x * 16;
-
-    // accumulatorを0で初期化
-    wmma::fill_fragment(frag_C, 0.0f);
-
-    // Kの次元を16ずつ進む
-    for (int k = 0; k < K; k += 16)
-    {
-        if (warp_row < M && warp_col < N && k + 16 <= K)
-        {
-            // ★ グローバルメモリからフラグメントにロード
-            // 32スレッドが協調して16×16タイルを読み込む
-            wmma::load_matrix_sync(frag_A, A + warp_row * K + k, K);
-            wmma::load_matrix_sync(frag_B, B + k * N + warp_col, N);
-
-            // ★ Tensor Coreで行列積！（これが1命令で16×16×16を計算）
-            wmma::mma_sync(frag_C, frag_A, frag_B, frag_C);
-        }
-    }
-
-    // 結果をグローバルメモリに書き出す
-    if (warp_row < M && warp_col < N)
-        wmma::store_matrix_sync(C + warp_row * N + warp_col, frag_C, N,
-            wmma::mem_row_major);
-}
-
-// FP32行列をFP16に変換するカーネル
-__global__ void convert_fp32_to_fp16(
-    const float* src, __half* dst, int n)
-{
+// FP32 → FP16 変換
+__global__ void k_f32_to_f16(const float* s, __half* d, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
+    if (i < n) d[i] = __float2half(s[i]);
 }
 
-int main()
+// LayerNorm: y = (x - mean) / sqrt(var + 1e-5) * gamma + beta
+__global__ void k_layernorm(
+    const float* x, float* y,
+    const float* gamma, const float* beta,
+    int rows, int cols)
 {
-    // 行列サイズ（Tensor CoreはTILE_SIZEの倍数が必要）
-    const int M = 512;
-    const int K = 512;
-    const int N = 512;
+    __shared__ float s[256];
+    int row = blockIdx.x, tid = threadIdx.x;
+    if (row >= rows) return;
+    const float* xr = x + row * cols;
+    float* yr = y + row * cols;
 
-    printf("行列積: A(%dx%d) × B(%dx%d) = C(%dx%d)\n\n", M, K, K, N, M, N);
-    printf("FP32サイズ: %.1f MB × 3行列 = %.1f MB\n",
-        M * K * 4.0f / (1024 * 1024),
-        M * K * 4.0f / (1024 * 1024) * 3);
-    printf("FP16サイズ: %.1f MB × 2行列 = %.1f MB（半分！）\n\n",
-        M * K * 2.0f / (1024 * 1024),
-        M * K * 2.0f / (1024 * 1024) * 2);
+    // mean
+    float sum = 0;
+    for (int j = tid; j < cols; j += 256) sum += xr[j];
+    s[tid] = sum; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] += s[tid + st]; __syncthreads(); }
+    float mean = s[0] / cols;
 
-    int total = M * N;
+    // var
+    float var = 0;
+    for (int j = tid; j < cols; j += 256) { float d = xr[j] - mean; var += d * d; }
+    s[tid] = var; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] += s[tid + st]; __syncthreads(); }
+    float inv = rsqrtf(s[0] / cols + 1e-5f);
 
-    // CPU側メモリ
-    float* h_A = new float[M * K];
-    float* h_B = new float[K * N];
-    float* h_C_fp32 = new float[total]();
-    float* h_C_tensor = new float[total]();
+    for (int j = tid; j < cols; j += 256)
+        yr[j] = (xr[j] - mean) * inv * gamma[j] + beta[j];
+}
 
-    // 初期化
-    srand(42);
-    for (int i = 0; i < M * K; i++) h_A[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
-    for (int i = 0; i < K * N; i++) h_B[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
+// GELU: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715x³)))
+__global__ void k_gelu(float* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+}
 
-    // GPU: FP32メモリ
-    float* d_A_fp32, * d_B_fp32, * d_C_fp32;
-    cudaMalloc(&d_A_fp32, M * K * sizeof(float));
-    cudaMalloc(&d_B_fp32, K * N * sizeof(float));
-    cudaMalloc(&d_C_fp32, total * sizeof(float));
-    cudaMemcpy(d_A_fp32, h_A, M * K * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B_fp32, h_B, K * N * sizeof(float), cudaMemcpyHostToDevice);
+// 要素加算 a += b
+__global__ void k_add(float* a, const float* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
 
-    // GPU: FP16メモリ（FP32から変換）
-    __half* d_A_fp16, * d_B_fp16;
-    float* d_C_tensor;
-    cudaMalloc(&d_A_fp16, M * K * sizeof(__half));
-    cudaMalloc(&d_B_fp16, K * N * sizeof(__half));
-    cudaMalloc(&d_C_tensor, total * sizeof(float));
+// バイアス加算 x[row, col] += bias[col]
+__global__ void k_add_bias(float* x, const float* b, int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * cols) x[i] += b[i % cols];
+}
 
-    // FP32 → FP16変換カーネルを実行
-    int conv_block = 256;
-    convert_fp32_to_fp16 << <(M * K + conv_block - 1) / conv_block, conv_block >> >
-        (d_A_fp32, d_A_fp16, M * K);
-    convert_fp32_to_fp16 << <(K * N + conv_block - 1) / conv_block, conv_block >> >
-        (d_B_fp32, d_B_fp16, K * N);
+// Embedding + Positional Encoding → FP32
+// wte[token_id, :] + wpe[pos, :] をそれぞれ FP16 で持つ
+__global__ void k_embed(
+    const int* tokens,
+    const __half* wte,  // [N_VOCAB, N_EMBD]
+    const __half* wpe,  // [N_CTX,   N_EMBD]
+    float* out,         // [seq, N_EMBD]
+    int seq_len)
+{
+    int pos = blockIdx.x, d = threadIdx.x;
+    if (pos >= seq_len || d >= N_EMBD) return;
+    int tok = tokens[pos];
+    out[pos * N_EMBD + d] = __half2float(wte[tok * N_EMBD + d])
+        + __half2float(wpe[pos * N_EMBD + d]);
+}
+
+// QKV を分割してヘッド次元でまとめ直す
+// qkv[seq, 3*N_EMBD] → Q,K,V それぞれ [N_HEAD, seq, D_HEAD]
+// Tensor Core batched GEMM のための連続化
+__global__ void k_qkv_split(
+    const float* qkv,  // [seq, 3*N_EMBD]
+    __half* Q,         // [N_HEAD, seq, D_HEAD]
+    __half* K,
+    __half* V,
+    int seq_len)
+{
+    int h = blockIdx.x, s = blockIdx.y, d = threadIdx.x;
+    if (h >= N_HEAD || s >= seq_len || d >= D_HEAD) return;
+    int oi = h * seq_len * D_HEAD + s * D_HEAD + d;
+    int ii = s * 3 * N_EMBD + h * D_HEAD + d;
+    Q[oi] = __float2half(qkv[ii]);
+    K[oi] = __float2half(qkv[ii + N_EMBD]);
+    V[oi] = __float2half(qkv[ii + 2 * N_EMBD]);
+}
+
+// Causal Softmax: scores [N_HEAD, seq, seq] にマスク + Softmax
+// 未来トークン (k > q) を -inf にする → GPTの自己回帰性
+__global__ void k_softmax_causal(float* S, int seq_len) {
+    __shared__ float s[256];
+    int h = blockIdx.x, q = blockIdx.y, tid = threadIdx.x;
+    float* row = S + (h * seq_len + q) * seq_len;
+
+    // Causal mask
+    for (int k = tid; k < seq_len; k += 256)
+        if (k > q) row[k] = -1e10f;
+    __syncthreads();
+
+    // Max
+    float tmax = -FLT_MAX;
+    for (int k = tid; k <= q; k += 256) tmax = fmaxf(tmax, row[k]);
+    s[tid] = tmax; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] = fmaxf(s[tid], s[tid + st]); __syncthreads(); }
+
+    // Exp + sum
+    float tsum = 0;
+    for (int k = tid; k < seq_len; k += 256) { row[k] = expf(row[k] - s[0]); tsum += row[k]; }
+    s[tid] = tsum; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] += s[tid + st]; __syncthreads(); }
+
+    for (int k = tid; k < seq_len; k += 256) row[k] /= s[0];
+}
+
+// Attention出力をヘッドから結合
+// ctx_t [N_HEAD, seq, D_HEAD] → out [seq, N_EMBD]
+__global__ void k_ctx_merge(
+    const float* ctx_t,
+    float* out,
+    int seq_len)
+{
+    int h = blockIdx.x, s = blockIdx.y, d = threadIdx.x;
+    if (h >= N_HEAD || s >= seq_len || d >= D_HEAD) return;
+    out[s * N_EMBD + h * D_HEAD + d] = ctx_t[h * seq_len * D_HEAD + s * D_HEAD + d];
+}
+
+// ============================================================
+// モデル重み
+// ============================================================
+struct GPT2W {
+    __half* wte;   // [N_VOCAB, N_EMBD]  トークン埋め込み
+    __half* wpe;   // [N_CTX,   N_EMBD]  位置埋め込み
+
+    // 各レイヤー
+    float* ln1w[N_LAYER], * ln1b[N_LAYER];   // LayerNorm1
+    __half* qkv_w[N_LAYER];  // [N_EMBD, 3*N_EMBD]  QKV投影
+    float* qkv_b[N_LAYER];  // [3*N_EMBD]
+    __half* cp_w[N_LAYER];   // [N_EMBD, N_EMBD]  Attn出力投影
+    float* cp_b[N_LAYER];   // [N_EMBD]
+    float* ln2w[N_LAYER], * ln2b[N_LAYER];   // LayerNorm2
+    __half* fc_w[N_LAYER];   // [N_EMBD, D_FF]    FFN 1層目
+    float* fc_b[N_LAYER];   // [D_FF]
+    __half* pp_w[N_LAYER];   // [D_FF,   N_EMBD]  FFN 2層目
+    float* pp_b[N_LAYER];   // [N_EMBD]
+
+    float* lnfw, * lnfb;     // 最終 LayerNorm
+};
+
+// ============================================================
+// 推論バッファ
+// ============================================================
+struct GPT2B {
+    float* x;          // [N_CTX, N_EMBD]  現在の隠れ状態
+    float* ln_out;     // LayerNorm出力
+    float* qkv_out;    // [N_CTX, 3*N_EMBD]
+    __half* Q;          // [N_HEAD, N_CTX, D_HEAD]
+    __half* K;
+    __half* V;
+    float* scores;     // [N_HEAD, N_CTX, N_CTX]  Attention Score
+    __half* scores16;   // FP16版（Tensor Core入力用）
+    float* ctx_t;      // [N_HEAD, N_CTX, D_HEAD]  Attention出力
+    float* ctx;        // [N_CTX, N_EMBD]  ヘッド結合後
+    float* proj_out;   // Attn投影出力
+    float* fc_out;     // [N_CTX, D_FF]
+    float* ff_out;     // [N_CTX, N_EMBD]
+    float* lnf_out;    // 最終LN出力
+    float* logits;     // [N_VOCAB]  次トークンの確率分布
+
+    // cuBLAS FP16入力用バッファ
+    __half* x16;        // [N_CTX, N_EMBD]
+    __half* ctx16;
+    __half* fc16;       // [N_CTX, D_FF]
+    __half* last16;     // [N_EMBD]  最後のトークンのみ
+
+    int* d_tok;      // [N_CTX]  GPU上のトークン列
+};
+
+// ============================================================
+// 重みロードヘルパー
+// ============================================================
+static __half* load_f16(FILE* f, int n) {
+    float* h = new float[n]; fread(h, 4, n, f);
+    float* d32; cudaMalloc(&d32, n * 4);
+    __half* d16; cudaMalloc(&d16, n * 2);
+    cudaMemcpy(d32, h, n * 4, cudaMemcpyHostToDevice);
+    k_f32_to_f16 << <(n + 255) / 256, 256 >> > (d32, d16, n);
+    cudaFree(d32); delete[] h; return d16;
+}
+static float* load_f32(FILE* f, int n) {
+    float* h = new float[n]; fread(h, 4, n, f);
+    float* d; cudaMalloc(&d, n * 4);
+    cudaMemcpy(d, h, n * 4, cudaMemcpyHostToDevice);
+    delete[] h; return d;
+}
+
+bool load_weights(GPT2W& w, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Cannot open: %s\n", path); return false; }
+    unsigned hdr[6]; fread(hdr, 4, 6, f);
+    if (hdr[0] != 0x47505432) { fprintf(stderr, "Bad magic\n"); return false; }
+    printf("GPT-2 small: vocab=%u ctx=%u embd=%u heads=%u layers=%u\n",
+        hdr[1], hdr[2], hdr[3], hdr[4], hdr[5]);
+
+    w.wte = load_f16(f, N_VOCAB * N_EMBD);
+    w.wpe = load_f16(f, N_CTX * N_EMBD);
+
+    for (int l = 0; l < N_LAYER; l++) {
+        w.ln1w[l] = load_f32(f, N_EMBD);
+        w.ln1b[l] = load_f32(f, N_EMBD);
+        w.qkv_w[l] = load_f16(f, N_EMBD * 3 * N_EMBD);
+        w.qkv_b[l] = load_f32(f, 3 * N_EMBD);
+        w.cp_w[l] = load_f16(f, N_EMBD * N_EMBD);
+        w.cp_b[l] = load_f32(f, N_EMBD);
+        w.ln2w[l] = load_f32(f, N_EMBD);
+        w.ln2b[l] = load_f32(f, N_EMBD);
+        w.fc_w[l] = load_f16(f, N_EMBD * D_FF);
+        w.fc_b[l] = load_f32(f, D_FF);
+        w.pp_w[l] = load_f16(f, D_FF * N_EMBD);
+        w.pp_b[l] = load_f32(f, N_EMBD);
+        if (l % 4 == 3) printf("  layer %d/%d loaded\n", l + 1, N_LAYER);
+    }
+    w.lnfw = load_f32(f, N_EMBD);
+    w.lnfb = load_f32(f, N_EMBD);
+    fclose(f);
+    printf("重みロード完了（GPU上: FP16）\n");
+    return true;
+}
+
+void alloc_buffers(GPT2B& b) {
+    auto f32 = [](float** p, int n) {cudaMalloc(p, n * 4); cudaMemset(*p, 0, n * 4); };
+    auto f16 = [](__half** p, int n) {cudaMalloc(p, n * 2); cudaMemset(*p, 0, n * 2); };
+
+    f32(&b.x, N_CTX * N_EMBD);
+    f32(&b.ln_out, N_CTX * N_EMBD);
+    f32(&b.qkv_out, N_CTX * 3 * N_EMBD);
+    f16(&b.Q, N_HEAD * N_CTX * D_HEAD);
+    f16(&b.K, N_HEAD * N_CTX * D_HEAD);
+    f16(&b.V, N_HEAD * N_CTX * D_HEAD);
+    f32(&b.scores, N_HEAD * N_CTX * N_CTX);
+    f16(&b.scores16, N_HEAD * N_CTX * N_CTX);
+    f32(&b.ctx_t, N_HEAD * N_CTX * D_HEAD);
+    f32(&b.ctx, N_CTX * N_EMBD);
+    f32(&b.proj_out, N_CTX * N_EMBD);
+    f32(&b.fc_out, N_CTX * D_FF);
+    f32(&b.ff_out, N_CTX * N_EMBD);
+    f32(&b.lnf_out, N_CTX * N_EMBD);
+    f32(&b.logits, N_VOCAB);
+    f16(&b.x16, N_CTX * N_EMBD);
+    f16(&b.ctx16, N_CTX * N_EMBD);
+    f16(&b.fc16, N_CTX * D_FF);
+    f16(&b.last16, N_EMBD);
+    cudaMalloc(&b.d_tok, N_CTX * sizeof(int));
+}
+
+// ============================================================
+// cuBLAS GEMM ヘルパー（Tensor Core使用）
+// ============================================================
+
+static void gemm(cublasHandle_t h,
+    const __half* A, const __half* B, float* C,
+    int M, int N, int K,
+    float alpha = 1.f, float beta = 0.f)
+{
+    CUBLAS_CHECK(cublasGemmEx(h,
+        CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+        &alpha, B, CUDA_R_16F, N, A, CUDA_R_16F, K,
+        &beta, C, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+static void gemm_bt(cublasHandle_t h,
+    const __half* A, const __half* B, float* C,
+    int M, int N, int K)
+{
+    float alpha = 1.f, beta = 0.f;
+    CUBLAS_CHECK(cublasGemmEx(h,
+        CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+        &alpha, B, CUDA_R_16F, K, A, CUDA_R_16F, K,
+        &beta, C, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+static void batched_qk(cublasHandle_t h,
+    const __half* Q, const __half* K, float* S,
+    int seq_len, float scale)
+{
+    float beta = 0.f;
+    long long sQK = (long long)seq_len * D_HEAD;
+    long long sS = (long long)seq_len * seq_len;
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(h,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        seq_len, seq_len, D_HEAD,
+        &scale,
+        K, CUDA_R_16F, D_HEAD, sQK,
+        Q, CUDA_R_16F, D_HEAD, sQK,
+        &beta,
+        S, CUDA_R_32F, seq_len, sS,
+        N_HEAD,
+        CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+static void batched_av(cublasHandle_t h,
+    const __half* attn, const __half* V, float* ctx,
+    int seq_len)
+{
+    float alpha = 1.f, beta = 0.f;
+    long long sA = (long long)seq_len * seq_len;
+    long long sV = (long long)seq_len * D_HEAD;
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(h,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        D_HEAD, seq_len, seq_len,
+        &alpha,
+        V, CUDA_R_16F, D_HEAD, sV,
+        attn, CUDA_R_16F, seq_len, sA,
+        &beta,
+        ctx, CUDA_R_32F, D_HEAD, sV,
+        N_HEAD,
+        CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+// ============================================================
+// BPEトークナイザ（Tokenizer構造体を先に定義）
+// ============================================================
+struct Tokenizer {
+    std::unordered_map<std::string, int> vocab;
+    std::vector<std::string> id2tok;
+
+    bool load(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "Cannot open tokenizer: %s\n", path); return false; }
+        unsigned n; fread(&n, 4, 1, f);
+        id2tok.resize(n);
+        vocab.reserve(n);
+        for (unsigned i = 0; i < n; i++) {
+            unsigned len; fread(&len, 4, 1, f);
+            std::string s(len, '\0');
+            fread(&s[0], 1, len, f);
+            id2tok[i] = s;
+            vocab[s] = i;
+        }
+        fclose(f);
+        printf("Tokenizer loaded: %u tokens\n", n);
+        return true;
+    }
+
+    std::vector<int> encode(const std::string& text) {
+        std::vector<int> out;
+        size_t i = 0;
+        while (i < text.size()) {
+            bool found = false;
+            for (int len = (int)std::min(text.size() - i, (size_t)20); len > 0; len--) {
+                auto it = vocab.find(text.substr(i, len));
+                if (it != vocab.end()) {
+                    out.push_back(it->second);
+                    i += len;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) { out.push_back(vocab.count("?") ? vocab["?"] : 0); i++; }
+        }
+        return out;
+    }
+
+    std::string decode(int id) {
+        if (id < 0 || id >= (int)id2tok.size()) return "?";
+        return id2tok[id];
+    }
+};
+
+// ============================================================
+// GPT-2 フォワードパス（1トークン生成）
+// ============================================================
+int forward(cublasHandle_t cb, GPT2W& w, GPT2B& b, const std::vector<int>& tokens, Tokenizer& tok) {
+    int seq = (int)tokens.size();
+    if (seq > N_CTX) { fprintf(stderr, "seq too long\n"); return -1; }
+
+    cudaMemcpy(b.d_tok, tokens.data(), seq * sizeof(int), cudaMemcpyHostToDevice);
+
+    k_embed << <seq, N_EMBD >> > (b.d_tok, w.wte, w.wpe, b.x, seq);
+
+    float scale = 1.0f / sqrtf((float)D_HEAD);
+
+    for (int l = 0; l < N_LAYER; l++) {
+        k_layernorm << <seq, 256 >> > (b.x, b.ln_out, w.ln1w[l], w.ln1b[l], seq, N_EMBD);
+        k_f32_to_f16 << <(seq * N_EMBD + 255) / 256, 256 >> > (b.ln_out, b.x16, seq * N_EMBD);
+        gemm(cb, b.x16, w.qkv_w[l], b.qkv_out, seq, 3 * N_EMBD, N_EMBD);
+        k_add_bias << <(seq * 3 * N_EMBD + 255) / 256, 256 >> > (b.qkv_out, w.qkv_b[l], seq, 3 * N_EMBD);
+
+        dim3 gQKV(N_HEAD, seq), bQKV(D_HEAD);
+        k_qkv_split << <gQKV, bQKV >> > (b.qkv_out, b.Q, b.K, b.V, seq);
+
+        batched_qk(cb, b.Q, b.K, b.scores, seq, scale);
+        k_softmax_causal << <dim3(N_HEAD, seq), 256 >> > (b.scores, seq);
+        k_f32_to_f16 << <(N_HEAD * seq * seq + 255) / 256, 256 >> > (b.scores, b.scores16, N_HEAD * seq * seq);
+        batched_av(cb, b.scores16, b.V, b.ctx_t, seq);
+
+        k_ctx_merge << <dim3(N_HEAD, seq), D_HEAD >> > (b.ctx_t, b.ctx, seq);
+
+        k_f32_to_f16 << <(seq * N_EMBD + 255) / 256, 256 >> > (b.ctx, b.ctx16, seq * N_EMBD);
+        gemm(cb, b.ctx16, w.cp_w[l], b.proj_out, seq, N_EMBD, N_EMBD);
+        k_add_bias << <(seq * N_EMBD + 255) / 256, 256 >> > (b.proj_out, w.cp_b[l], seq, N_EMBD);
+        k_add << <(seq * N_EMBD + 255) / 256, 256 >> > (b.x, b.proj_out, seq * N_EMBD);
+
+        k_layernorm << <seq, 256 >> > (b.x, b.ln_out, w.ln2w[l], w.ln2b[l], seq, N_EMBD);
+        k_f32_to_f16 << <(seq * N_EMBD + 255) / 256, 256 >> > (b.ln_out, b.x16, seq * N_EMBD);
+        gemm(cb, b.x16, w.fc_w[l], b.fc_out, seq, D_FF, N_EMBD);
+        k_add_bias << <(seq * D_FF + 255) / 256, 256 >> > (b.fc_out, w.fc_b[l], seq, D_FF);
+
+        k_gelu << <(seq * D_FF + 255) / 256, 256 >> > (b.fc_out, seq * D_FF);
+
+        k_f32_to_f16 << <(seq * D_FF + 255) / 256, 256 >> > (b.fc_out, b.fc16, seq * D_FF);
+        gemm(cb, b.fc16, w.pp_w[l], b.ff_out, seq, N_EMBD, D_FF);
+        k_add_bias << <(seq * N_EMBD + 255) / 256, 256 >> > (b.ff_out, w.pp_b[l], seq, N_EMBD);
+        k_add << <(seq * N_EMBD + 255) / 256, 256 >> > (b.x, b.ff_out, seq * N_EMBD);
+    }
+
+    k_layernorm << <1, 256 >> > (b.x + (seq - 1) * N_EMBD, b.lnf_out, w.lnfw, w.lnfb, 1, N_EMBD);
+    k_f32_to_f16 << <(N_EMBD + 255) / 256, 256 >> > (b.lnf_out, b.last16, N_EMBD);
+    gemm_bt(cb, b.last16, w.wte, b.logits, 1, N_VOCAB, N_EMBD);
+
     cudaDeviceSynchronize();
 
-    // タイマー
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    std::vector<float> logits_h(N_VOCAB);
+    cudaMemcpy(logits_h.data(), b.logits, N_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // ---- ① FP32版 ----
-    printf("① FP32 Tiled MatMul 実行中...\n");
-    dim3 fp32_block(TILE_SIZE, TILE_SIZE);
-    dim3 fp32_grid(
-        (N + TILE_SIZE - 1) / TILE_SIZE,
-        (M + TILE_SIZE - 1) / TILE_SIZE);
+    // ===== logits 診断（最初の3ステップのみ） =====
+    if (tokens.size() <= 3) {
+        float minval = *std::min_element(logits_h.begin(), logits_h.end());
+        float maxval = *std::max_element(logits_h.begin(), logits_h.end());
+        printf("\n[DEBUG] Logits stats (step %zu):\n", tokens.size());
+        printf("  Min: %f, Max: %f\n", minval, maxval);
 
-    cudaEventRecord(start);
-    for (int i = 0; i < 100; i++)
-        matmul_fp32 << <fp32_grid, fp32_block >> > (d_A_fp32, d_B_fp32, d_C_fp32, M, N, K);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+        // Top 5 token を手動で抽出
+        std::vector<int> top5_ids;
+        for (int i = 0; i < N_VOCAB; i++) {
+            top5_ids.push_back(i);
+        }
+        std::partial_sort(top5_ids.begin(), top5_ids.begin() + 5, top5_ids.end(),
+            [&logits_h](int a, int b) { return logits_h[a] > logits_h[b]; });
 
-    float ms_fp32 = 0;
-    cudaEventElapsedTime(&ms_fp32, start, stop);
-    cudaMemcpy(h_C_fp32, d_C_fp32, total * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("  時間: %.3f ms (100回合計)\n\n", ms_fp32);
-
-    // ---- ② Tensor Core版 ----
-    printf("② FP16 Tensor Core MatMul 実行中...\n");
-    // 1ワープ=32スレッド、y方向に並べる
-    dim3 tc_block(16, 32);
-    dim3 tc_grid(
-        (N + TILE_SIZE - 1) / TILE_SIZE,
-        (M + TILE_SIZE - 1) / TILE_SIZE * 2);
-
-    cudaEventRecord(start);
-    for (int i = 0; i < 100; i++)
-        matmul_tensor_core << <tc_grid, tc_block >> > (d_A_fp16, d_B_fp16, d_C_tensor, M, N, K);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float ms_tensor = 0;
-    cudaEventElapsedTime(&ms_tensor, start, stop);
-    cudaMemcpy(h_C_tensor, d_C_tensor, total * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("  時間: %.3f ms (100回合計)\n\n", ms_tensor);
-
-    // ---- 速度比較 ----
-    printf("速度比較:\n");
-    printf("  FP32 Tiled:         %.3f ms\n", ms_fp32);
-    printf("  FP16 Tensor Core:   %.3f ms\n", ms_tensor);
-    printf("  速度向上: %.2fx\n\n", ms_fp32 / ms_tensor);
-
-    // ---- 精度検証 ----
-    // FP16は精度が落ちるので誤差が大きめになる（それが正常）
-    float max_diff = 0.0f;
-    float avg_diff = 0.0f;
-    for (int i = 0; i < total; i++)
-    {
-        float diff = fabsf(h_C_fp32[i] - h_C_tensor[i]);
-        max_diff = fmaxf(max_diff, diff);
-        avg_diff += diff;
+        printf("  Top 5 tokens:\n");
+        for (int i = 0; i < 5; i++) {
+            int id = top5_ids[i];
+            printf("    %d: logit=%f, decoded='%s'\n", id, logits_h[id], tok.decode(id).c_str());
+        }
     }
-    avg_diff /= total;
+    // ===== 診断終了 =====
 
-    printf("FP32 vs FP16 誤差:\n");
-    printf("  最大誤差: %.4f\n", max_diff);
-    printf("  平均誤差: %.4f\n", avg_diff);
-    printf("  ※FP16は仮数部が少ないため誤差は出るが実用上問題なし\n\n");
+    return (int)(std::max_element(logits_h.begin(), logits_h.end()) - logits_h.begin());
+}
 
-    // メモリ節約量の表示
-    printf("メモリ使用量比較:\n");
-    printf("  FP32: %d MB\n", (int)((M * K + K * N) * sizeof(float) / (1024 * 1024)));
-    printf("  FP16: %d MB（%.0f%%削減）\n",
-        (int)((M * K + K * N) * sizeof(__half) / (1024 * 1024)),
-        50.0f);
+// ============================================================
+// メイン
+// ============================================================
+int main(int argc, char* argv[]) {
+    const char* weights_path = "gpt2_weights.bin";
+    const char* tokenizer_path = "gpt2_tokenizer.bin";
 
-    // 後片付け
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    delete[] h_A; delete[] h_B; delete[] h_C_fp32; delete[] h_C_tensor;
-    cudaFree(d_A_fp32); cudaFree(d_B_fp32); cudaFree(d_C_fp32);
-    cudaFree(d_A_fp16); cudaFree(d_B_fp16); cudaFree(d_C_tensor);
-    cudaDeviceReset();
+    if (argc >= 3) {
+        weights_path = argv[1];
+        tokenizer_path = argv[2];
+    }
+
+    cublasHandle_t cb;
+    CUBLAS_CHECK(cublasCreate(&cb));
+    CUBLAS_CHECK(cublasSetMathMode(cb, CUBLAS_TENSOR_OP_MATH));
+
+    GPT2W w; GPT2B b;
+    if (!load_weights(w, weights_path)) return 1;
+    alloc_buffers(b);
+
+    Tokenizer tok;
+    if (!tok.load(tokenizer_path)) return 1;
+
+    printf("\n=== C++ Tokenizer Diagnosis ===\n");
+    printf("First 20 tokens from id2tok:\n");
+    for (int i = 0; i < 20; i++) {
+        std::string s = tok.id2tok[i];
+        printf("  %5d: '", i);
+        for (char c : s) {
+            if (c < 32 || c > 126) printf("\\x%02x", (unsigned char)c);
+            else if (c == '\'') printf("\\'");
+            else printf("%c", c);
+        }
+        printf("'\n");
+    }
+    printf("\nEncode test:\n");
+    std::string test = "hello";
+    auto test_tokens = tok.encode(test);
+    printf("  Input: 'hello'\n  Tokens: ");
+    for (int t : test_tokens) printf("%d ", t);
+    printf("\n");
+
+    printf("\n=== GPT-2 Inference (Tensor Core / cuBLAS) ===\n");
+    printf("Prompt: ");
+    std::string prompt;
+    std::getline(std::cin, prompt);
+    if (prompt.empty()) prompt = "Hello, world!";
+
+    std::vector<int> tokens = tok.encode(prompt);
+    printf("Tokens: %zu\n", tokens.size());
+
+    printf("\n%s", prompt.c_str());
+    fflush(stdout);
+
+    for (int step = 0; step < MAX_GEN; step++) {
+        if ((int)tokens.size() >= N_CTX) break;
+        int next = forward(cb, w, b, tokens, tok);
+
+        if (next < 0) break;
+        tokens.push_back(next);
+        printf("%s", tok.decode(next).c_str());
+        fflush(stdout);
+        if (next == 50256) break;
+    }
+    printf("\n\n生成完了 (%d tokens)\n", (int)tokens.size());
+
+    cublasDestroy(cb);
     return 0;
 }
