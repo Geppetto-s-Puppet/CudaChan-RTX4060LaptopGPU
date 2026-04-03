@@ -1,15 +1,12 @@
 ﻿// ============================================================
 // GPT-2 推論エンジン（CUDA + Tensor Core + cuBLAS）
+// 継続会話・ログ保存・top-k サンプリング対応版
 //
 // GPT-2 small アーキテクチャ:
 //   vocab=50257  ctx=1024  embd=768  heads=12  layers=12
 //
-// Tensor Core使用箇所:
-//   cublasGemmEx / cublasGemmStridedBatchedEx
-//   with CUBLAS_COMPUTE_32F_FAST_16F
-//   → 全GEMM（QKV投影/Attention/FFN/LMHead）でTensor Core起動
-//
-// 実行: Cuda-Chan.exe gpt2_weights.bin gpt2_tokenizer.bin
+// 実行: Cuda-Chan.exe [gpt2_weights.bin gpt2_tokenizer.bin]
+// 終了: "exit" または "quit" を入力
 // ============================================================
 
 #include "cuda_runtime.h"
@@ -27,11 +24,44 @@
 #include <unordered_map>
 #include <algorithm>
 #include <iostream>
+#include <random>
+#include <fstream>
+#include <sstream>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #pragma comment(lib, "cublas.lib")
 
 // ============================================================
-// GPT-2 small 定数
+// ★ ユーザー設定 ★  ← ここを自由に編集してね
+// ============================================================
+
+// デバッグ情報をコンソールに表示するか
+//   true  → logits の min/max や Top-5 トークンを毎ステップ表示
+//   false → クリーンな会話出力のみ（通常はこっち）
+static const bool DEBUG_MODE = false;
+
+// AIの名前・性格・口調（システムプロンプト）
+// GPT-2 は chat fine-tune されていないので完璧ではないが、
+// フォーマットを守ることで会話らしい出力になる
+static const std::string AI_NAME = "Cuda-Chan";
+static const std::string SYSTEM_PROMPT =
+"The following is a conversation with " + AI_NAME + ".\n"
++ AI_NAME + " is a helpful AI assistant.\n"
++ AI_NAME + " always stays on topic and answers directly.\n\n"
++ AI_NAME + ": Hello! I am " + AI_NAME + ", your AI assistant. How can I help you?\n\n";
+
+// サンプリング設定
+static const int   TOP_K = 40;    // 候補トークン数（10〜100 推奨）
+static const float TEMPERATURE = 0.6f; // 温度（0.5=保守的 / 0.85=バランス / 1.2=創造的）
+
+// 生成設定
+static const int         MAX_GEN = 200;                    // 1ターンの最大生成トークン数
+static const std::string LOG_FILE = "conversation_log.txt"; // 会話ログ保存先ファイル名
+
+// ============================================================
+// GPT-2 small 定数（変更不要）
 // ============================================================
 #define N_VOCAB  50257
 #define N_CTX    1024
@@ -40,7 +70,6 @@
 #define N_LAYER  12
 #define D_HEAD   64      // N_EMBD / N_HEAD
 #define D_FF     3072    // N_EMBD * 4
-#define MAX_GEN  256
 
 #define CUDA_CHECK(x) do { \
     cudaError_t e=(x); \
@@ -50,6 +79,14 @@
     cublasStatus_t s=(x); \
     if(s!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"cuBLAS error %d (%s:%d)\n",s,__FILE__,__LINE__);exit(1);} \
 } while(0)
+
+// ============================================================
+// ログ保存ヘルパー（追記モード）
+// ============================================================
+static void append_log(const std::string& text) {
+    std::ofstream f(LOG_FILE, std::ios::app);
+    if (f.is_open()) f << text;
+}
 
 // ============================================================
 // CUDA カーネル群
@@ -77,14 +114,14 @@ __global__ void k_layernorm(
     float sum = 0;
     for (int j = tid; j < cols; j += 256) sum += xr[j];
     s[tid] = sum; __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] += s[tid + st]; __syncthreads(); }
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st) s[tid] += s[tid + st]; __syncthreads(); }
     float mean = s[0] / cols;
 
     // var
     float var = 0;
     for (int j = tid; j < cols; j += 256) { float d = xr[j] - mean; var += d * d; }
     s[tid] = var; __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] += s[tid + st]; __syncthreads(); }
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st) s[tid] += s[tid + st]; __syncthreads(); }
     float inv = rsqrtf(s[0] / cols + 1e-5f);
 
     for (int j = tid; j < cols; j += 256)
@@ -112,7 +149,6 @@ __global__ void k_add_bias(float* x, const float* b, int rows, int cols) {
 }
 
 // Embedding + Positional Encoding → FP32
-// wte[token_id, :] + wpe[pos, :] をそれぞれ FP16 で持つ
 __global__ void k_embed(
     const int* tokens,
     const __half* wte,  // [N_VOCAB, N_EMBD]
@@ -127,14 +163,10 @@ __global__ void k_embed(
         + __half2float(wpe[pos * N_EMBD + d]);
 }
 
-// QKV を分割してヘッド次元でまとめ直す
-// qkv[seq, 3*N_EMBD] → Q,K,V それぞれ [N_HEAD, seq, D_HEAD]
-// Tensor Core batched GEMM のための連続化
+// QKV 分割: qkv[seq, 3*N_EMBD] → Q,K,V [N_HEAD, seq, D_HEAD]
 __global__ void k_qkv_split(
-    const float* qkv,  // [seq, 3*N_EMBD]
-    __half* Q,         // [N_HEAD, seq, D_HEAD]
-    __half* K,
-    __half* V,
+    const float* qkv,
+    __half* Q, __half* K, __half* V,
     int seq_len)
 {
     int h = blockIdx.x, s = blockIdx.y, d = threadIdx.x;
@@ -146,35 +178,30 @@ __global__ void k_qkv_split(
     V[oi] = __float2half(qkv[ii + 2 * N_EMBD]);
 }
 
-// Causal Softmax: scores [N_HEAD, seq, seq] にマスク + Softmax
-// 未来トークン (k > q) を -inf にする → GPTの自己回帰性
+// Causal Softmax（未来トークンをマスク）
 __global__ void k_softmax_causal(float* S, int seq_len) {
     __shared__ float s[256];
     int h = blockIdx.x, q = blockIdx.y, tid = threadIdx.x;
     float* row = S + (h * seq_len + q) * seq_len;
 
-    // Causal mask
     for (int k = tid; k < seq_len; k += 256)
         if (k > q) row[k] = -1e10f;
     __syncthreads();
 
-    // Max
     float tmax = -FLT_MAX;
     for (int k = tid; k <= q; k += 256) tmax = fmaxf(tmax, row[k]);
     s[tid] = tmax; __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] = fmaxf(s[tid], s[tid + st]); __syncthreads(); }
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st) s[tid] = fmaxf(s[tid], s[tid + st]); __syncthreads(); }
 
-    // Exp + sum
     float tsum = 0;
     for (int k = tid; k < seq_len; k += 256) { row[k] = expf(row[k] - s[0]); tsum += row[k]; }
     s[tid] = tsum; __syncthreads();
-    for (int st = 128; st > 0; st >>= 1) { if (tid < st)s[tid] += s[tid + st]; __syncthreads(); }
+    for (int st = 128; st > 0; st >>= 1) { if (tid < st) s[tid] += s[tid + st]; __syncthreads(); }
 
     for (int k = tid; k < seq_len; k += 256) row[k] /= s[0];
 }
 
-// Attention出力をヘッドから結合
-// ctx_t [N_HEAD, seq, D_HEAD] → out [seq, N_EMBD]
+// Attention ヘッド結合: ctx_t[N_HEAD, seq, D_HEAD] → out[seq, N_EMBD]
 __global__ void k_ctx_merge(
     const float* ctx_t,
     float* out,
@@ -189,51 +216,32 @@ __global__ void k_ctx_merge(
 // モデル重み
 // ============================================================
 struct GPT2W {
-    __half* wte;   // [N_VOCAB, N_EMBD]  トークン埋め込み
-    __half* wpe;   // [N_CTX,   N_EMBD]  位置埋め込み
+    __half* wte;   // [N_VOCAB, N_EMBD]
+    __half* wpe;   // [N_CTX,   N_EMBD]
 
-    // 各レイヤー
-    float* ln1w[N_LAYER], * ln1b[N_LAYER];   // LayerNorm1
-    __half* qkv_w[N_LAYER];  // [N_EMBD, 3*N_EMBD]  QKV投影
-    float* qkv_b[N_LAYER];  // [3*N_EMBD]
-    __half* cp_w[N_LAYER];   // [N_EMBD, N_EMBD]  Attn出力投影
-    float* cp_b[N_LAYER];   // [N_EMBD]
-    float* ln2w[N_LAYER], * ln2b[N_LAYER];   // LayerNorm2
-    __half* fc_w[N_LAYER];   // [N_EMBD, D_FF]    FFN 1層目
-    float* fc_b[N_LAYER];   // [D_FF]
-    __half* pp_w[N_LAYER];   // [D_FF,   N_EMBD]  FFN 2層目
-    float* pp_b[N_LAYER];   // [N_EMBD]
+    float* ln1w[N_LAYER], * ln1b[N_LAYER];
+    __half* qkv_w[N_LAYER];  float* qkv_b[N_LAYER];
+    __half* cp_w[N_LAYER];   float* cp_b[N_LAYER];
+    float* ln2w[N_LAYER], * ln2b[N_LAYER];
+    __half* fc_w[N_LAYER];   float* fc_b[N_LAYER];
+    __half* pp_w[N_LAYER];   float* pp_b[N_LAYER];
 
-    float* lnfw, * lnfb;     // 最終 LayerNorm
+    float* lnfw, * lnfb;
 };
 
 // ============================================================
 // 推論バッファ
 // ============================================================
 struct GPT2B {
-    float* x;          // [N_CTX, N_EMBD]  現在の隠れ状態
-    float* ln_out;     // LayerNorm出力
-    float* qkv_out;    // [N_CTX, 3*N_EMBD]
-    __half* Q;          // [N_HEAD, N_CTX, D_HEAD]
-    __half* K;
-    __half* V;
-    float* scores;     // [N_HEAD, N_CTX, N_CTX]  Attention Score
-    __half* scores16;   // FP16版（Tensor Core入力用）
-    float* ctx_t;      // [N_HEAD, N_CTX, D_HEAD]  Attention出力
-    float* ctx;        // [N_CTX, N_EMBD]  ヘッド結合後
-    float* proj_out;   // Attn投影出力
-    float* fc_out;     // [N_CTX, D_FF]
-    float* ff_out;     // [N_CTX, N_EMBD]
-    float* lnf_out;    // 最終LN出力
-    float* logits;     // [N_VOCAB]  次トークンの確率分布
-
-    // cuBLAS FP16入力用バッファ
-    __half* x16;        // [N_CTX, N_EMBD]
-    __half* ctx16;
-    __half* fc16;       // [N_CTX, D_FF]
-    __half* last16;     // [N_EMBD]  最後のトークンのみ
-
-    int* d_tok;      // [N_CTX]  GPU上のトークン列
+    float* x, * ln_out, * qkv_out;
+    __half* Q, * K, * V;
+    float* scores;
+    __half* scores16;
+    float* ctx_t, * ctx, * proj_out;
+    float* fc_out, * ff_out, * lnf_out;
+    float* logits;
+    __half* x16, * ctx16, * fc16, * last16;
+    int* d_tok;
 };
 
 // ============================================================
@@ -247,6 +255,7 @@ static __half* load_f16(FILE* f, int n) {
     k_f32_to_f16 << <(n + 255) / 256, 256 >> > (d32, d16, n);
     cudaFree(d32); delete[] h; return d16;
 }
+
 static float* load_f32(FILE* f, int n) {
     float* h = new float[n]; fread(h, 4, n, f);
     float* d; cudaMalloc(&d, n * 4);
@@ -288,8 +297,8 @@ bool load_weights(GPT2W& w, const char* path) {
 }
 
 void alloc_buffers(GPT2B& b) {
-    auto f32 = [](float** p, int n) {cudaMalloc(p, n * 4); cudaMemset(*p, 0, n * 4); };
-    auto f16 = [](__half** p, int n) {cudaMalloc(p, n * 2); cudaMemset(*p, 0, n * 2); };
+    auto f32 = [](float** p, int n) { cudaMalloc(p, n * 4); cudaMemset(*p, 0, n * 4); };
+    auto f16 = [](__half** p, int n) { cudaMalloc(p, n * 2); cudaMemset(*p, 0, n * 2); };
 
     f32(&b.x, N_CTX * N_EMBD);
     f32(&b.ln_out, N_CTX * N_EMBD);
@@ -316,7 +325,6 @@ void alloc_buffers(GPT2B& b) {
 // ============================================================
 // cuBLAS GEMM ヘルパー（Tensor Core使用）
 // ============================================================
-
 static void gemm(cublasHandle_t h,
     const __half* A, const __half* B, float* C,
     int M, int N, int K,
@@ -380,7 +388,7 @@ static void batched_av(cublasHandle_t h,
 }
 
 // ============================================================
-// BPEトークナイザ（Tokenizer構造体を先に定義）
+// BPEトークナイザ
 // ============================================================
 struct Tokenizer {
     std::unordered_map<std::string, int> vocab;
@@ -389,13 +397,22 @@ struct Tokenizer {
     bool load(const char* path) {
         FILE* f = fopen(path, "rb");
         if (!f) { fprintf(stderr, "Cannot open tokenizer: %s\n", path); return false; }
-        unsigned n; fread(&n, 4, 1, f);
+        unsigned n;
+        if (fread(&n, 4, 1, f) != 1) { fclose(f); return false; }
+        if (n > N_VOCAB + 1000) { fprintf(stderr, "Bad token count: %u\n", n); fclose(f); return false; }
+
         id2tok.resize(n);
         vocab.reserve(n);
+
         for (unsigned i = 0; i < n; i++) {
-            unsigned len; fread(&len, 4, 1, f);
+            unsigned len;
+            if (fread(&len, 4, 1, f) != 1 || len > 1000) {
+                fprintf(stderr, "Bad token at %u\n", i); fclose(f); return false;
+            }
             std::string s(len, '\0');
-            fread(&s[0], 1, len, f);
+            if (fread(&s[0], 1, len, f) != len) {
+                fprintf(stderr, "Read fail at token %u\n", i); fclose(f); return false;
+            }
             id2tok[i] = s;
             vocab[s] = i;
         }
@@ -423,33 +440,95 @@ struct Tokenizer {
         return out;
     }
 
-    std::string decode(int id) {
-        if (id < 0 || id >= (int)id2tok.size()) return "?";
+    // 生テキストとして返す（コンソール出力用）
+    const std::string& decode(int id) const {
+        static const std::string unk = "?";
+        if (id < 0 || id >= (int)id2tok.size()) return unk;
         return id2tok[id];
+    }
+
+    // デバッグ用（非表示文字をエスケープ表示）
+    std::string decode_escaped(int id) const {
+        if (id < 0 || id >= (int)id2tok.size()) return "?";
+        std::string out;
+        for (unsigned char c : id2tok[id]) {
+            if (c < 32 || c > 126) {
+                char buf[8]; snprintf(buf, 8, "\\x%02x", c);
+                out += buf;
+            }
+            else {
+                out += (char)c;
+            }
+        }
+        return out;
     }
 };
 
 // ============================================================
+// Top-k サンプリング
+// ============================================================
+static std::mt19937 g_rng(std::random_device{}());
+
+static int sample_topk(const std::vector<float>& logits) {
+    int k = std::min(TOP_K, N_VOCAB);
+
+    // 温度スケール + Top-k 抽出
+    std::vector<std::pair<float, int>> scored(N_VOCAB);
+    for (int i = 0; i < N_VOCAB; i++)
+        scored[i] = { logits[i] / TEMPERATURE, i };
+
+    std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
+        [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+            return a.first > b.first;
+        });
+
+    // Softmax（top-k のみ）
+    float maxv = scored[0].first, sumexp = 0.f;
+    for (int i = 0; i < k; i++) {
+        scored[i].first = expf(scored[i].first - maxv);
+        sumexp += scored[i].first;
+    }
+    for (int i = 0; i < k; i++) scored[i].first /= sumexp;
+
+    // 累積分布サンプリング
+    std::uniform_real_distribution<float> dist(0.f, 1.f);
+    float r = dist(g_rng), cumsum = 0.f;
+    for (int i = 0; i < k; i++) {
+        cumsum += scored[i].first;
+        if (r <= cumsum) return scored[i].second;
+    }
+    return scored[0].second;
+}
+
+// ============================================================
 // GPT-2 フォワードパス（1トークン生成）
 // ============================================================
-int forward(cublasHandle_t cb, GPT2W& w, GPT2B& b, const std::vector<int>& tokens, Tokenizer& tok) {
+int forward(cublasHandle_t cb, GPT2W& w, GPT2B& b,
+    const std::vector<int>& tokens, const Tokenizer& tok)
+{
     int seq = (int)tokens.size();
     if (seq > N_CTX) { fprintf(stderr, "seq too long\n"); return -1; }
 
-    cudaMemcpy(b.d_tok, tokens.data(), seq * sizeof(int), cudaMemcpyHostToDevice);
+    for (int i = 0; i < seq; i++) {
+        if (tokens[i] < 0 || tokens[i] >= N_VOCAB) {
+            fprintf(stderr, "Invalid token %d at pos %d\n", tokens[i], i);
+            return -1;
+        }
+    }
 
+    cudaMemcpy(b.d_tok, tokens.data(), seq * sizeof(int), cudaMemcpyHostToDevice);
     k_embed << <seq, N_EMBD >> > (b.d_tok, w.wte, w.wpe, b.x, seq);
 
-    float scale = 1.0f / sqrtf((float)D_HEAD);
+    const float scale = 1.0f / sqrtf((float)D_HEAD);
 
     for (int l = 0; l < N_LAYER; l++) {
+        // Self-Attention
         k_layernorm << <seq, 256 >> > (b.x, b.ln_out, w.ln1w[l], w.ln1b[l], seq, N_EMBD);
         k_f32_to_f16 << <(seq * N_EMBD + 255) / 256, 256 >> > (b.ln_out, b.x16, seq * N_EMBD);
         gemm(cb, b.x16, w.qkv_w[l], b.qkv_out, seq, 3 * N_EMBD, N_EMBD);
         k_add_bias << <(seq * 3 * N_EMBD + 255) / 256, 256 >> > (b.qkv_out, w.qkv_b[l], seq, 3 * N_EMBD);
 
-        dim3 gQKV(N_HEAD, seq), bQKV(D_HEAD);
-        k_qkv_split << <gQKV, bQKV >> > (b.qkv_out, b.Q, b.K, b.V, seq);
+        k_qkv_split << <dim3(N_HEAD, seq), D_HEAD >> > (b.qkv_out, b.Q, b.K, b.V, seq);
 
         batched_qk(cb, b.Q, b.K, b.scores, seq, scale);
         k_softmax_causal << <dim3(N_HEAD, seq), 256 >> > (b.scores, seq);
@@ -463,6 +542,7 @@ int forward(cublasHandle_t cb, GPT2W& w, GPT2B& b, const std::vector<int>& token
         k_add_bias << <(seq * N_EMBD + 255) / 256, 256 >> > (b.proj_out, w.cp_b[l], seq, N_EMBD);
         k_add << <(seq * N_EMBD + 255) / 256, 256 >> > (b.x, b.proj_out, seq * N_EMBD);
 
+        // Feed-Forward Network
         k_layernorm << <seq, 256 >> > (b.x, b.ln_out, w.ln2w[l], w.ln2b[l], seq, N_EMBD);
         k_f32_to_f16 << <(seq * N_EMBD + 255) / 256, 256 >> > (b.ln_out, b.x16, seq * N_EMBD);
         gemm(cb, b.x16, w.fc_w[l], b.fc_out, seq, D_FF, N_EMBD);
@@ -476,106 +556,212 @@ int forward(cublasHandle_t cb, GPT2W& w, GPT2B& b, const std::vector<int>& token
         k_add << <(seq * N_EMBD + 255) / 256, 256 >> > (b.x, b.ff_out, seq * N_EMBD);
     }
 
+    // LM Head
     k_layernorm << <1, 256 >> > (b.x + (seq - 1) * N_EMBD, b.lnf_out, w.lnfw, w.lnfb, 1, N_EMBD);
     k_f32_to_f16 << <(N_EMBD + 255) / 256, 256 >> > (b.lnf_out, b.last16, N_EMBD);
     gemm_bt(cb, b.last16, w.wte, b.logits, 1, N_VOCAB, N_EMBD);
-
     cudaDeviceSynchronize();
 
     std::vector<float> logits_h(N_VOCAB);
     cudaMemcpy(logits_h.data(), b.logits, N_VOCAB * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // ===== logits 診断（最初の3ステップのみ） =====
-    if (tokens.size() <= 3) {
-        float minval = *std::min_element(logits_h.begin(), logits_h.end());
-        float maxval = *std::max_element(logits_h.begin(), logits_h.end());
-        printf("\n[DEBUG] Logits stats (step %zu):\n", tokens.size());
-        printf("  Min: %f, Max: %f\n", minval, maxval);
+    // デバッグ表示（DEBUG_MODE == true のときのみ）
+    if (DEBUG_MODE) {
+        float minv = *std::min_element(logits_h.begin(), logits_h.end());
+        float maxv = *std::max_element(logits_h.begin(), logits_h.end());
+        printf("\n[DEBUG] step=%zu  logits min=%.3f max=%.3f\n", tokens.size(), minv, maxv);
 
-        // Top 5 token を手動で抽出
-        std::vector<int> top5_ids;
-        for (int i = 0; i < N_VOCAB; i++) {
-            top5_ids.push_back(i);
-        }
-        std::partial_sort(top5_ids.begin(), top5_ids.begin() + 5, top5_ids.end(),
+        std::vector<int> idx(N_VOCAB);
+        for (int i = 0; i < N_VOCAB; i++) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
             [&logits_h](int a, int b) { return logits_h[a] > logits_h[b]; });
-
-        printf("  Top 5 tokens:\n");
-        for (int i = 0; i < 5; i++) {
-            int id = top5_ids[i];
-            printf("    %d: logit=%f, decoded='%s'\n", id, logits_h[id], tok.decode(id).c_str());
-        }
+        printf("  Top5:");
+        for (int i = 0; i < 5; i++)
+            printf(" [%d '%s' %.3f]", idx[i], tok.decode_escaped(idx[i]).c_str(), logits_h[idx[i]]);
+        printf("\n");
     }
-    // ===== 診断終了 =====
 
-    return (int)(std::max_element(logits_h.begin(), logits_h.end()) - logits_h.begin());
+    return sample_topk(logits_h);
 }
 
 // ============================================================
-// メイン
+// メイン（継続会話ループ）
 // ============================================================
 int main(int argc, char* argv[]) {
+    // Windows: コンソールを UTF-8 に設定
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     const char* weights_path = "gpt2_weights.bin";
     const char* tokenizer_path = "gpt2_tokenizer.bin";
+    if (argc >= 3) { weights_path = argv[1]; tokenizer_path = argv[2]; }
 
-    if (argc >= 3) {
-        weights_path = argv[1];
-        tokenizer_path = argv[2];
-    }
-
+    // cuBLAS 初期化
     cublasHandle_t cb;
     CUBLAS_CHECK(cublasCreate(&cb));
     CUBLAS_CHECK(cublasSetMathMode(cb, CUBLAS_TENSOR_OP_MATH));
 
+    // 重みロード・バッファ確保
     GPT2W w; GPT2B b;
     if (!load_weights(w, weights_path)) return 1;
     alloc_buffers(b);
 
+    // トークナイザロード
     Tokenizer tok;
     if (!tok.load(tokenizer_path)) return 1;
 
-    printf("\n=== C++ Tokenizer Diagnosis ===\n");
-    printf("First 20 tokens from id2tok:\n");
-    for (int i = 0; i < 20; i++) {
-        std::string s = tok.id2tok[i];
-        printf("  %5d: '", i);
-        for (char c : s) {
-            if (c < 32 || c > 126) printf("\\x%02x", (unsigned char)c);
-            else if (c == '\'') printf("\\'");
-            else printf("%c", c);
-        }
-        printf("'\n");
+    // デバッグ時のみトークナイザ診断を表示
+    if (DEBUG_MODE) {
+        printf("\n[DEBUG] === Tokenizer Diagnosis ===\n");
+        printf("First 20 tokens:\n");
+        for (int i = 0; i < 20; i++)
+            printf("  %5d: '%s'\n", i, tok.decode_escaped(i).c_str());
+        auto t = tok.encode("hello");
+        printf("encode('hello') → %d → '%s'\n", t[0], tok.decode(t[0]).c_str());
     }
-    printf("\nEncode test:\n");
-    std::string test = "hello";
-    auto test_tokens = tok.encode(test);
-    printf("  Input: 'hello'\n  Tokens: ");
-    for (int t : test_tokens) printf("%d ", t);
-    printf("\n");
 
-    printf("\n=== GPT-2 Inference (Tensor Core / cuBLAS) ===\n");
-    printf("Prompt: ");
-    std::string prompt;
-    std::getline(std::cin, prompt);
-    if (prompt.empty()) prompt = "Hello, world!";
+    // ログファイルにセッション開始を記録
+    {
+        std::time_t now = std::time(nullptr);
+        char tbuf[64];
+        strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+        append_log("\n========================================\n");
+        append_log(std::string("Session: ") + tbuf + "\n");
+        append_log("[System] " + SYSTEM_PROMPT + "\n");
+    }
 
-    std::vector<int> tokens = tok.encode(prompt);
-    printf("Tokens: %zu\n", tokens.size());
+    // ヘッダ表示
+    printf("\n================================================\n");
+    printf("  %s  (GPT-2 Tensor Core 推論エンジン)\n", AI_NAME.c_str());
+    printf("  'exit' / 'quit' で終了\n");
+    printf("  ログ保存先: %s\n", LOG_FILE.c_str());
+    printf("================================================\n\n");
 
-    printf("\n%s", prompt.c_str());
-    fflush(stdout);
+    // システムプロンプトのトークン列（コンテキスト切り詰め時に常に先頭に保持）
+    const std::vector<int> sys_tokens = tok.encode(SYSTEM_PROMPT);
+    const int sys_len = (int)sys_tokens.size();
+    const int max_input_len = N_CTX - MAX_GEN - 10;
 
-    for (int step = 0; step < MAX_GEN; step++) {
-        if ((int)tokens.size() >= N_CTX) break;
-        int next = forward(cb, w, b, tokens, tok);
+    // 会話履歴（文字列として管理）
+    std::string history = SYSTEM_PROMPT;
 
-        if (next < 0) break;
-        tokens.push_back(next);
-        printf("%s", tok.decode(next).c_str());
+    // ストリーミング出力用のストップパターン
+    // モデルがユーザーやAIの発言を自分で生成し始めたら止める
+    const std::vector<std::string> STOP_PATTERNS = {
+        "\nYou:",
+        std::string("\n") + AI_NAME + ":"
+    };
+    const int LOOKAHEAD = 20; // ストップパターンを先読みするバッファ長
+
+    // ============================================================
+    // 会話ループ
+    // ============================================================
+    while (true) {
+        printf("You: ");
         fflush(stdout);
-        if (next == 50256) break;
+
+        std::string user_input;
+        if (!std::getline(std::cin, user_input)) {
+            printf("\n(EOF検出。終了します)\n");
+            break;
+        }
+
+        // 終了コマンド
+        if (user_input == "exit" || user_input == "quit") {
+            printf("会話を終了します。ログ: %s\n", LOG_FILE.c_str());
+            break;
+        }
+        if (user_input.empty()) continue;
+
+        // ログに記録
+        append_log("You: " + user_input + "\n");
+
+        // プロンプト組み立て
+        std::string prompt = history + "You: " + user_input + "\n" + AI_NAME + ":";
+        std::vector<int> tokens = tok.encode(prompt);
+
+        // コンテキスト長超過時は古い会話を削除（システムプロンプトは保持）
+        if ((int)tokens.size() > max_input_len) {
+            int keep = max_input_len - sys_len;
+            std::vector<int> trimmed = sys_tokens;
+            if (keep > 0) {
+                trimmed.insert(trimmed.end(), tokens.end() - keep, tokens.end());
+            }
+            else {
+                trimmed = std::vector<int>(tokens.end() - max_input_len, tokens.end());
+            }
+            tokens = trimmed;
+            if (DEBUG_MODE)
+                printf("[DEBUG] Context trimmed to %d tokens\n", (int)tokens.size());
+        }
+
+        // ============================================================
+        // トークン生成（ストリーミング出力 + ルックアヘッドストップ）
+        // ============================================================
+        printf("%s:", AI_NAME.c_str());
+        fflush(stdout);
+
+        std::string response;   // 生成済み（確定済み）テキスト
+        std::string pending;    // 未表示のルックアヘッドバッファ
+        bool stopped = false;
+
+        for (int step = 0; step < MAX_GEN && !stopped; step++) {
+            if ((int)tokens.size() >= N_CTX) break;
+
+            int next = forward(cb, w, b, tokens, tok);
+            if (next < 0 || next == 50256) { stopped = true; break; }
+
+            tokens.push_back(next);
+            pending += tok.decode(next);
+
+            // ストップパターンチェック
+            size_t stop_pos = std::string::npos;
+            for (const auto& pat : STOP_PATTERNS) {
+                size_t p = pending.find(pat);
+                if (p != std::string::npos) {
+                    if (stop_pos == std::string::npos || p < stop_pos)
+                        stop_pos = p;
+                }
+            }
+
+            if (stop_pos != std::string::npos) {
+                // ストップ位置までを表示して終了
+                std::string safe = pending.substr(0, stop_pos);
+                printf("%s", safe.c_str());
+                fflush(stdout);
+                response += safe;
+                stopped = true;
+                break;
+            }
+
+            // ルックアヘッド分を残してそれ以前を出力
+            if ((int)pending.size() > LOOKAHEAD) {
+                std::string safe = pending.substr(0, pending.size() - LOOKAHEAD);
+                printf("%s", safe.c_str());
+                fflush(stdout);
+                response += safe;
+                pending = pending.substr(pending.size() - LOOKAHEAD);
+            }
+        }
+
+        // 残りのバッファを全部出力
+        if (!stopped && !pending.empty()) {
+            printf("%s", pending.c_str());
+            fflush(stdout);
+            response += pending;
+        }
+
+        printf("\n\n");
+
+        // 会話履歴を更新（次ターンのコンテキストに含める）
+        history += "You: " + user_input + "\n"
+            + AI_NAME + ": " + response + "\n\n";
+
+        // ログに記録
+        append_log(AI_NAME + ": " + response + "\n\n");
     }
-    printf("\n\n生成完了 (%d tokens)\n", (int)tokens.size());
 
     cublasDestroy(cb);
     return 0;
